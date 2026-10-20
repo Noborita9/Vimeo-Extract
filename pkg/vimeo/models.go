@@ -3,6 +3,7 @@ package vimeo
 type ViewerInfo struct {
 	JWT   string `json:"jwt"`
 	XSRFT string `json:"xsrft"`
+	VUID  string `json:"vuid"`
 }
 
 type PlayerConfig struct {
@@ -41,4 +42,9 @@ type AlbumVideo struct {
 	URI  string `json:"uri"`
 	Link string `json:"link"`
 	Name string `json:"name"`
+}
+
+type AlbumSingleVideoResponse struct {
+	Name            string `json:"name"`
+	PlayerEmbedURL  string `json:"player_embed_url"`
 }

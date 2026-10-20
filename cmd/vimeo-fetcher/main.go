@@ -18,34 +18,39 @@ func main() {
 		outputDir  string
 		langPref   string
 		referer    string
+		force      bool
 		listTracks bool
 	)
 
 	flag.StringVar(&rawURL, "u", "", "URL o ID del video / showcase de Vimeo")
 	flag.StringVar(&rawURL, "url", "", "URL o ID del video / showcase de Vimeo")
-	flag.StringVar(&password, "p", "", "Contraseña del video (si está protegido)")
-	flag.StringVar(&password, "password", "", "Contraseña del video (si está protegido)")
+	flag.StringVar(&password, "p", "", "Contraseña del video o showcase (si está protegido)")
+	flag.StringVar(&password, "password", "", "Contraseña del video o showcase (si está protegido)")
 	flag.StringVar(&outputDir, "o", "./output", "Directorio de salida para guardar las transcripciones")
 	flag.StringVar(&outputDir, "output", "./output", "Directorio de salida para guardar las transcripciones")
 	flag.StringVar(&langPref, "l", "es", "Código de idioma preferido para subtítulos (default: es)")
 	flag.StringVar(&langPref, "lang", "es", "Código de idioma preferido para subtítulos (default: es)")
 	flag.StringVar(&referer, "r", "", "Referer HTTP (ej: https://aulas.ort.edu.uy/)")
 	flag.StringVar(&referer, "referer", "", "Referer HTTP (ej: https://aulas.ort.edu.uy/)")
+	flag.BoolVar(&force, "f", false, "Sobrescribir si ya existe la transcripción")
+	flag.BoolVar(&force, "force", false, "Sobrescribir si ya existe la transcripción")
 	flag.BoolVar(&listTracks, "list-tracks", false, "Solo listar los tracks de subtítulos disponibles")
 
 	flag.Usage = func() {
 		fmt.Fprintf(os.Stderr, "Uso: vimeo-fetcher [opciones] <URL o ID>\n\n")
 		fmt.Fprintf(os.Stderr, "Ejemplos:\n")
-		fmt.Fprintf(os.Stderr, "  vimeo-fetcher -u \"https://vimeo.com/123456789\" -p \"secreto\"\n")
-		fmt.Fprintf(os.Stderr, "  vimeo-fetcher -u \"https://vimeo.com/showcase/987654\"\n")
-		fmt.Fprintf(os.Stderr, "  vimeo-fetcher \"123456789\"\n\n")
+		fmt.Fprintf(os.Stderr, "  # Descargar un video particular dentro de un showcase:\n")
+		fmt.Fprintf(os.Stderr, "  vimeo-fetcher -u \"https://vimeo.com/showcase/12367680?video=1236100586\" -p \"M1awjQrt\"\n\n")
+		fmt.Fprintf(os.Stderr, "  # Descargar todo un showcase (todas las clases):\n")
+		fmt.Fprintf(os.Stderr, "  vimeo-fetcher -u \"https://vimeo.com/showcase/12367680\" -p \"M1awjQrt\"\n\n")
+		fmt.Fprintf(os.Stderr, "  # Descargar un video individual de Vimeo:\n")
+		fmt.Fprintf(os.Stderr, "  vimeo-fetcher -u \"https://vimeo.com/123456789\" -p \"secreto\"\n\n")
 		fmt.Fprintf(os.Stderr, "Opciones:\n")
 		flag.PrintDefaults()
 	}
 
 	flag.Parse()
 
-	// Si no se pasó por flag -u, tomar el primer argumento posicional
 	if rawURL == "" && flag.NArg() > 0 {
 		rawURL = flag.Arg(0)
 	}
@@ -67,10 +72,23 @@ func main() {
 		os.Exit(1)
 	}
 
+	// Caso 1: Showcase completo
 	if target.IsShowcase {
 		fmt.Printf("📂 Detectado Showcase ID: %s\n", target.ShowcaseID)
+		var hashedPass string
+		if password != "" {
+			fmt.Println("🔑 Autenticando con contraseña en el showcase...")
+			h, err := client.AuthenticateShowcase(target.ShowcaseID, password)
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "❌ Error al autenticar showcase: %v\n", err)
+				os.Exit(1)
+			}
+			hashedPass = h
+			fmt.Println("✅ Showcase autenticado.")
+		}
+
 		fmt.Println("🔍 Obteniendo lista de videos del showcase...")
-		videos, err := client.FetchShowcaseVideos(target.ShowcaseID)
+		videos, err := client.FetchShowcaseVideos(target.ShowcaseID, hashedPass)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "❌ Error al obtener videos del showcase: %v\n", err)
 			os.Exit(1)
@@ -83,9 +101,19 @@ func main() {
 
 		fmt.Printf("✅ Se encontraron %d videos. Procesando...\n\n", len(videos))
 		successCount := 0
+		skippedCount := 0
+		showcaseReferer := fmt.Sprintf("https://vimeo.com/showcase/%s", target.ShowcaseID)
+
 		for i, vid := range videos {
 			fmt.Printf("[%d/%d] 🎬 %s (ID: %s)\n", i+1, len(videos), vid.Title, vid.ID)
-			savedPath, err := processSingleVideo(client, vid.ID, "", password, outputDir, langPref, listTracks)
+
+			if !force && storage.TranscriptExists(outputDir, vid.Title) {
+				fmt.Printf("   ⏭️ Ya existe en output/, salteando. (Usá -f para forzar descarga)\n\n")
+				skippedCount++
+				continue
+			}
+
+			savedPath, err := processShowcaseVideo(client, target.ShowcaseID, vid.ID, hashedPass, showcaseReferer, outputDir, langPref, force, listTracks)
 			if err != nil {
 				fmt.Printf("   ⚠️ Error: %v\n\n", err)
 			} else if !listTracks {
@@ -93,13 +121,47 @@ func main() {
 				successCount++
 			}
 		}
-		fmt.Printf("🎉 Proceso finalizado: %d/%d transcripciones guardadas.\n", successCount, len(videos))
+		fmt.Printf("🎉 Proceso finalizado: %d guardados, %d ya existían (total: %d videos).\n", successCount, skippedCount, len(videos))
 		return
 	}
 
-	// Video individual
+	// Caso 2: Video específico dentro de un showcase (?video=ID)
+	if target.ShowcaseID != "" && target.VideoID != "" {
+		fmt.Printf("🎬 Procesando video ID: %s (dentro del showcase %s)\n", target.VideoID, target.ShowcaseID)
+		var hashedPass string
+		if password != "" {
+			fmt.Println("🔑 Autenticando con contraseña en el showcase...")
+			h, err := client.AuthenticateShowcase(target.ShowcaseID, password)
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "❌ Error al autenticar showcase: %v\n", err)
+				os.Exit(1)
+			}
+			hashedPass = h
+			fmt.Println("✅ Showcase autenticado.")
+		}
+
+		showcaseReferer := fmt.Sprintf("https://vimeo.com/showcase/%s", target.ShowcaseID)
+		savedPath, err := processShowcaseVideo(client, target.ShowcaseID, target.VideoID, hashedPass, showcaseReferer, outputDir, langPref, force, listTracks)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "❌ Error: %v\n", err)
+			os.Exit(1)
+		}
+
+		if !listTracks {
+			fmt.Printf("✅ ¡Listo! Transcripción guardada en:\n👉 %s\n", savedPath)
+		}
+		return
+	}
+
+	// Caso 3: Video individual estándar
 	fmt.Printf("🎬 Procesando video ID: %s\n", target.VideoID)
-	savedPath, err := processSingleVideo(client, target.VideoID, target.UnlistedHash, password, outputDir, langPref, listTracks)
+	config, err := client.GetPlayerConfig(target.VideoID, target.UnlistedHash, password)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "❌ Error al obtener configuración del video: %v\n", err)
+		os.Exit(1)
+	}
+
+	savedPath, err := downloadAndSaveTranscript(client, config, target.VideoID, outputDir, langPref, force, listTracks)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "❌ Error: %v\n", err)
 		os.Exit(1)
@@ -110,12 +172,21 @@ func main() {
 	}
 }
 
-func processSingleVideo(client *vimeo.Client, videoID, unlistedHash, password, outputDir, langPref string, listOnly bool) (string, error) {
-	config, err := client.GetPlayerConfig(videoID, unlistedHash, password)
+func processShowcaseVideo(client *vimeo.Client, showcaseID, videoID, hashedPass, referer, outputDir, langPref string, force, listOnly bool) (string, error) {
+	embedURL, _, err := client.GetShowcaseVideoEmbedURL(showcaseID, videoID, hashedPass)
 	if err != nil {
-		return "", fmt.Errorf("no se pudo obtener la configuración del video: %w", err)
+		return "", fmt.Errorf("no se pudo obtener la URL del reproductor: %w", err)
 	}
 
+	config, err := client.GetPlayerConfigFromEmbedURL(embedURL, referer)
+	if err != nil {
+		return "", fmt.Errorf("no se pudo obtener la configuración del reproductor: %w", err)
+	}
+
+	return downloadAndSaveTranscript(client, config, videoID, outputDir, langPref, force, listOnly)
+}
+
+func downloadAndSaveTranscript(client *vimeo.Client, config *vimeo.PlayerConfig, videoID, outputDir, langPref string, force, listOnly bool) (string, error) {
 	tracks := config.Request.TextTracks
 	if len(tracks) == 0 {
 		return "", fmt.Errorf("el video no tiene pistas de subtítulos o transcripción disponibles")
@@ -129,7 +200,6 @@ func processSingleVideo(client *vimeo.Client, videoID, unlistedHash, password, o
 		return "", nil
 	}
 
-	// Seleccionar el track adecuado
 	selectedTrack := selectTrack(tracks, langPref)
 	if selectedTrack == nil {
 		return "", fmt.Errorf("no se encontró una pista de subtítulos adecuada")
@@ -153,7 +223,7 @@ func processSingleVideo(client *vimeo.Client, videoID, unlistedHash, password, o
 	}
 
 	md := transcript.BuildMarkdown(title, videoID, paragraphs)
-	savedFile, err := storage.SaveTranscript(outputDir, title, md)
+	savedFile, err := storage.SaveTranscript(outputDir, title, md, force)
 	if err != nil {
 		return "", fmt.Errorf("error al guardar archivo Markdown: %w", err)
 	}
@@ -171,7 +241,7 @@ func selectTrack(tracks []vimeo.TextTrack, langPref string) *vimeo.TextTrack {
 		}
 	}
 
-	// 2. Coincidencia de prefijo (ej: "es-es" con "es")
+	// 2. Coincidencia de prefijo (ej: "es-es" o "es-x-autogen" con "es")
 	for _, t := range tracks {
 		if strings.HasPrefix(strings.ToLower(t.Lang), langPref) {
 			return &t

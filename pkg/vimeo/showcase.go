@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"regexp"
 )
 
@@ -16,7 +17,7 @@ type ShowcaseVideo struct {
 	Link  string
 }
 
-func (c *Client) FetchShowcaseVideos(showcaseID string) ([]ShowcaseVideo, error) {
+func (c *Client) FetchShowcaseVideos(showcaseID, hashedPass string) ([]ShowcaseVideo, error) {
 	info, err := c.FetchViewerInfo()
 	if err != nil {
 		return nil, fmt.Errorf("error al obtener viewer token para showcase: %w", err)
@@ -28,6 +29,10 @@ func (c *Client) FetchShowcaseVideos(showcaseID string) ([]ShowcaseVideo, error)
 
 	for {
 		apiURL := fmt.Sprintf("https://api.vimeo.com/albums/%s/videos?page=%d&per_page=%d&fields=uri,link,name", showcaseID, page, perPage)
+		if hashedPass != "" {
+			apiURL += "&password=" + url.QueryEscape(hashedPass)
+		}
+
 		req, err := http.NewRequest("GET", apiURL, nil)
 		if err != nil {
 			return nil, err
@@ -35,12 +40,8 @@ func (c *Client) FetchShowcaseVideos(showcaseID string) ([]ShowcaseVideo, error)
 
 		req.Header.Set("User-Agent", c.userAgent)
 		req.Header.Set("Authorization", "jwt "+info.JWT)
-		req.Header.Set("Accept", "application/json")
-		if c.referer != "" {
-			req.Header.Set("Referer", c.referer)
-		} else {
-			req.Header.Set("Referer", fmt.Sprintf("https://vimeo.com/showcase/%s", showcaseID))
-		}
+		req.Header.Set("Accept", "application/vnd.vimeo.*+json;version=3.4")
+		req.Header.Set("Referer", fmt.Sprintf("https://vimeo.com/showcase/%s", showcaseID))
 
 		resp, err := c.httpClient.Do(req)
 		if err != nil {
@@ -76,4 +77,52 @@ func (c *Client) FetchShowcaseVideos(showcaseID string) ([]ShowcaseVideo, error)
 	}
 
 	return allVideos, nil
+}
+
+func (c *Client) GetShowcaseVideoEmbedURL(showcaseID, videoID, hashedPass string) (string, string, error) {
+	info, err := c.FetchViewerInfo()
+	if err != nil {
+		return "", "", fmt.Errorf("error al obtener viewer token: %w", err)
+	}
+
+	apiURL := fmt.Sprintf("https://api.vimeo.com/albums/%s/videos/%s", showcaseID, videoID)
+	if hashedPass != "" {
+		apiURL += "?password=" + url.QueryEscape(hashedPass)
+	}
+
+	req, err := http.NewRequest("GET", apiURL, nil)
+	if err != nil {
+		return "", "", err
+	}
+
+	req.Header.Set("User-Agent", c.userAgent)
+	req.Header.Set("Authorization", "jwt "+info.JWT)
+	req.Header.Set("Accept", "application/vnd.vimeo.*+json;version=3.4")
+	req.Header.Set("Referer", fmt.Sprintf("https://vimeo.com/showcase/%s", showcaseID))
+
+	resp, err := c.httpClient.Do(req)
+	if err != nil {
+		return "", "", fmt.Errorf("error al solicitar detalles del video del showcase: %w", err)
+	}
+	defer resp.Body.Close()
+
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return "", "", err
+	}
+
+	if resp.StatusCode != http.StatusOK {
+		return "", "", fmt.Errorf("album video API devolvió status %d: %s", resp.StatusCode, string(body))
+	}
+
+	var res AlbumSingleVideoResponse
+	if err := json.Unmarshal(body, &res); err != nil {
+		return "", "", fmt.Errorf("error al decodificar respuesta del video del showcase: %w", err)
+	}
+
+	if res.PlayerEmbedURL == "" {
+		return "", res.Name, fmt.Errorf("no se encontró player_embed_url en la respuesta del video")
+	}
+
+	return res.PlayerEmbedURL, res.Name, nil
 }

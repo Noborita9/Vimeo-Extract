@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"mime/multipart"
 	"net/http"
 	"net/http/cookiejar"
 	"net/url"
@@ -77,6 +78,21 @@ func (c *Client) FetchViewerInfo() (*ViewerInfo, error) {
 	}
 
 	c.viewerInfo = &info
+
+	// Asegurar que la cookie vuid esté registrada en el jar para .vimeo.com
+	if info.VUID != "" && c.httpClient.Jar != nil {
+		vimeoURL, _ := url.Parse("https://vimeo.com")
+		c.httpClient.Jar.SetCookies(vimeoURL, []*http.Cookie{
+			{
+				Name:   "vuid",
+				Value:  info.VUID,
+				Domain: ".vimeo.com",
+				Path:   "/",
+				Secure: true,
+			},
+		})
+	}
+
 	return c.viewerInfo, nil
 }
 
@@ -121,6 +137,68 @@ func (c *Client) SubmitPassword(videoID, password string) error {
 	}
 
 	return nil
+}
+
+func (c *Client) AuthenticateShowcase(showcaseID, password string) (string, error) {
+	info, err := c.FetchViewerInfo()
+	if err != nil {
+		return "", fmt.Errorf("error al obtener viewer info para showcase: %w", err)
+	}
+
+	var body bytes.Buffer
+	writer := multipart.NewWriter(&body)
+	if err := writer.WriteField("password", password); err != nil {
+		return "", err
+	}
+	if err := writer.WriteField("token", info.XSRFT); err != nil {
+		return "", err
+	}
+	if err := writer.WriteField("referer_url", fmt.Sprintf("/showcase/%s", showcaseID)); err != nil {
+		return "", err
+	}
+	if err := writer.Close(); err != nil {
+		return "", err
+	}
+
+	authURL := fmt.Sprintf("https://vimeo.com/showcase/%s/auth", showcaseID)
+	req, err := http.NewRequest("POST", authURL, &body)
+	if err != nil {
+		return "", err
+	}
+
+	req.Header.Set("User-Agent", c.userAgent)
+	req.Header.Set("Content-Type", writer.FormDataContentType())
+	req.Header.Set("Accept", "application/json")
+	req.Header.Set("X-Requested-With", "XMLHttpRequest")
+	req.Header.Set("Referer", fmt.Sprintf("https://vimeo.com/showcase/%s", showcaseID))
+
+	resp, err := c.httpClient.Do(req)
+	if err != nil {
+		return "", fmt.Errorf("error al autenticar showcase: %w", err)
+	}
+	defer resp.Body.Close()
+
+	respData, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode == http.StatusUnauthorized {
+		return "", fmt.Errorf("contraseña incorrecta para el showcase (HTTP 401)")
+	}
+	if resp.StatusCode != http.StatusOK {
+		return "", fmt.Errorf("error al autenticar showcase (HTTP %d): %s", resp.StatusCode, string(respData))
+	}
+
+	var authRes struct {
+		HashedPass string `json:"hashed_pass"`
+		ErrorCode  *int   `json:"error_code"`
+	}
+	if err := json.Unmarshal(respData, &authRes); err != nil {
+		return "", fmt.Errorf("error al decodificar respuesta de auth del showcase: %w", err)
+	}
+
+	if authRes.ErrorCode != nil && *authRes.ErrorCode != 0 {
+		return "", fmt.Errorf("showcase auth devolvió código de error %d", *authRes.ErrorCode)
+	}
+
+	return authRes.HashedPass, nil
 }
 
 func (c *Client) GetPlayerConfig(videoID, unlistedHash, password string) (*PlayerConfig, error) {
@@ -180,7 +258,6 @@ func (c *Client) GetPlayerConfig(videoID, unlistedHash, password string) (*Playe
 	}
 
 	if err != nil {
-		// Si se proveyó password y falló con otro error, intentamos autenticar antes de rendirnos
 		if password != "" {
 			if submitErr := c.SubmitPassword(videoID, password); submitErr == nil {
 				cfg, _, err = fetchConfig()
@@ -193,6 +270,54 @@ func (c *Client) GetPlayerConfig(videoID, unlistedHash, password string) (*Playe
 	}
 
 	return cfg, nil
+}
+
+func (c *Client) GetPlayerConfigFromEmbedURL(embedURL, referer string) (*PlayerConfig, error) {
+	req, err := http.NewRequest("GET", embedURL, nil)
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("User-Agent", c.userAgent)
+	if referer != "" {
+		req.Header.Set("Referer", referer)
+	}
+
+	resp, err := c.httpClient.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("error al solicitar embed player: %w", err)
+	}
+	defer resp.Body.Close()
+
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, err
+	}
+
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("el embed player devolvió HTTP %d", resp.StatusCode)
+	}
+
+	htmlContent := string(body)
+	prefix := "window.playerConfig = "
+	idx := strings.Index(htmlContent, prefix)
+	if idx == -1 {
+		return nil, fmt.Errorf("no se encontró window.playerConfig en la página del player")
+	}
+
+	endIdx := strings.Index(htmlContent[idx:], "</script>")
+	if endIdx == -1 {
+		return nil, fmt.Errorf("no se pudo delimitar el script de playerConfig")
+	}
+
+	jsonStr := strings.TrimSpace(htmlContent[idx+len(prefix) : idx+endIdx])
+	jsonStr = strings.TrimSuffix(jsonStr, ";")
+
+	var cfg PlayerConfig
+	if err := json.Unmarshal([]byte(jsonStr), &cfg); err != nil {
+		return nil, fmt.Errorf("error al parsear JSON de playerConfig: %w", err)
+	}
+
+	return &cfg, nil
 }
 
 func (c *Client) DownloadTrack(trackURL string) (string, error) {
