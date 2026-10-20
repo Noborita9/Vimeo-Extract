@@ -1,0 +1,280 @@
+package vimeo
+
+import (
+	"bytes"
+	"encoding/json"
+	"fmt"
+	"io"
+	"net/http"
+	"net/http/cookiejar"
+	"net/url"
+	"regexp"
+	"strings"
+	"time"
+)
+
+const (
+	defaultUserAgent = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+	viewerInfoURL    = "https://vimeo.com/_next/viewer"
+)
+
+var (
+	showcaseURLRegex = regexp.MustCompile(`vimeo\.com/showcase/(\d+)`)
+	playerURLRegex   = regexp.MustCompile(`player\.vimeo\.com/video/(\d+)`)
+	vimeoURLRegex    = regexp.MustCompile(`vimeo\.com/(?:video/)?(\d+)(?:/([a-zA-Z0-9]+))?`)
+	numericRegex     = regexp.MustCompile(`^\d+$`)
+)
+
+type Client struct {
+	httpClient *http.Client
+	viewerInfo *ViewerInfo
+	referer    string
+	userAgent  string
+}
+
+func NewClient(referer string) (*Client, error) {
+	jar, err := cookiejar.New(nil)
+	if err != nil {
+		return nil, fmt.Errorf("error al inicializar cookie jar: %w", err)
+	}
+
+	return &Client{
+		httpClient: &http.Client{
+			Jar:     jar,
+			Timeout: 30 * time.Second,
+		},
+		referer:   referer,
+		userAgent: defaultUserAgent,
+	}, nil
+}
+
+func (c *Client) FetchViewerInfo() (*ViewerInfo, error) {
+	if c.viewerInfo != nil {
+		return c.viewerInfo, nil
+	}
+
+	req, err := http.NewRequest("GET", viewerInfoURL, nil)
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("User-Agent", c.userAgent)
+	req.Header.Set("Accept", "application/json")
+
+	resp, err := c.httpClient.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("falló la solicitud a viewer info: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		return nil, fmt.Errorf("viewer info devolvió status %d: %s", resp.StatusCode, string(body))
+	}
+
+	var info ViewerInfo
+	if err := json.NewDecoder(resp.Body).Decode(&info); err != nil {
+		return nil, fmt.Errorf("error al decodificar viewer info: %w", err)
+	}
+
+	c.viewerInfo = &info
+	return c.viewerInfo, nil
+}
+
+func (c *Client) SubmitPassword(videoID, password string) error {
+	info, err := c.FetchViewerInfo()
+	if err != nil {
+		return fmt.Errorf("no se pudo obtener token para verificar contraseña: %w", err)
+	}
+
+	payload, err := json.Marshal(map[string]string{
+		"password": password,
+		"token":    info.XSRFT,
+	})
+	if err != nil {
+		return err
+	}
+
+	pwdURL := fmt.Sprintf("https://vimeo.com/%s/password", videoID)
+	req, err := http.NewRequest("POST", pwdURL, bytes.NewBuffer(payload))
+	if err != nil {
+		return err
+	}
+
+	req.Header.Set("User-Agent", c.userAgent)
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("X-Requested-With", "XMLHttpRequest")
+	req.Header.Set("Accept", "*/*")
+	req.Header.Set("Referer", fmt.Sprintf("https://vimeo.com/%s", videoID))
+
+	resp, err := c.httpClient.Do(req)
+	if err != nil {
+		return fmt.Errorf("error al enviar contraseña: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode == 418 {
+		return fmt.Errorf("la contraseña ingresada es incorrecta (HTTP 418)")
+	}
+	if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusFound {
+		body, _ := io.ReadAll(resp.Body)
+		return fmt.Errorf("error al validar contraseña (status %d): %s", resp.StatusCode, string(body))
+	}
+
+	return nil
+}
+
+func (c *Client) GetPlayerConfig(videoID, unlistedHash, password string) (*PlayerConfig, error) {
+	configURL := fmt.Sprintf("https://player.vimeo.com/video/%s/config", videoID)
+	if unlistedHash != "" {
+		configURL += "?h=" + url.QueryEscape(unlistedHash)
+	}
+
+	fetchConfig := func() (*PlayerConfig, int, error) {
+		req, err := http.NewRequest("GET", configURL, nil)
+		if err != nil {
+			return nil, 0, err
+		}
+		req.Header.Set("User-Agent", c.userAgent)
+		req.Header.Set("Accept", "application/json")
+		if c.referer != "" {
+			req.Header.Set("Referer", c.referer)
+		} else {
+			req.Header.Set("Referer", fmt.Sprintf("https://vimeo.com/%s", videoID))
+		}
+
+		resp, err := c.httpClient.Do(req)
+		if err != nil {
+			return nil, 0, err
+		}
+		defer resp.Body.Close()
+
+		body, err := io.ReadAll(resp.Body)
+		if err != nil {
+			return nil, resp.StatusCode, err
+		}
+
+		if resp.StatusCode != http.StatusOK {
+			return nil, resp.StatusCode, fmt.Errorf("config devolvió HTTP %d: %s", resp.StatusCode, string(body))
+		}
+
+		var cfg PlayerConfig
+		if err := json.Unmarshal(body, &cfg); err != nil {
+			return nil, resp.StatusCode, fmt.Errorf("error al parsear JSON de config: %w", err)
+		}
+		return &cfg, resp.StatusCode, nil
+	}
+
+	cfg, statusCode, err := fetchConfig()
+	if err != nil && (statusCode == http.StatusForbidden || statusCode == http.StatusUnauthorized || strings.Contains(err.Error(), "403")) {
+		if password != "" {
+			if submitErr := c.SubmitPassword(videoID, password); submitErr != nil {
+				return nil, fmt.Errorf("falló la autenticación con contraseña: %w", submitErr)
+			}
+			cfg, _, err = fetchConfig()
+			if err != nil {
+				return nil, fmt.Errorf("error al obtener config tras ingresar contraseña: %w", err)
+			}
+			return cfg, nil
+		}
+		return nil, fmt.Errorf("el video requiere contraseña o referer válido (HTTP %d)", statusCode)
+	}
+
+	if err != nil {
+		// Si se proveyó password y falló con otro error, intentamos autenticar antes de rendirnos
+		if password != "" {
+			if submitErr := c.SubmitPassword(videoID, password); submitErr == nil {
+				cfg, _, err = fetchConfig()
+				if err == nil {
+					return cfg, nil
+				}
+			}
+		}
+		return nil, err
+	}
+
+	return cfg, nil
+}
+
+func (c *Client) DownloadTrack(trackURL string) (string, error) {
+	req, err := http.NewRequest("GET", trackURL, nil)
+	if err != nil {
+		return "", err
+	}
+	req.Header.Set("User-Agent", c.userAgent)
+
+	resp, err := c.httpClient.Do(req)
+	if err != nil {
+		return "", fmt.Errorf("error al descargar subtítulos: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return "", fmt.Errorf("la descarga de subtítulos devolvió status %d", resp.StatusCode)
+	}
+
+	data, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return "", fmt.Errorf("error al leer contenido de subtítulos: %w", err)
+	}
+
+	return string(data), nil
+}
+
+type ParsedTarget struct {
+	VideoID      string
+	UnlistedHash string
+	IsShowcase   bool
+	ShowcaseID   string
+}
+
+func ParseURL(raw string) (*ParsedTarget, error) {
+	raw = strings.TrimSpace(raw)
+	if numericRegex.MatchString(raw) {
+		return &ParsedTarget{VideoID: raw}, nil
+	}
+
+	parsed, err := url.Parse(raw)
+	if err != nil {
+		return nil, fmt.Errorf("URL inválida: %w", err)
+	}
+
+	// Caso: showcase con video query param
+	if m := showcaseURLRegex.FindStringSubmatch(raw); len(m) > 1 {
+		showcaseID := m[1]
+		videoParam := parsed.Query().Get("video")
+		if videoParam != "" {
+			return &ParsedTarget{
+				VideoID:    videoParam,
+				IsShowcase: false,
+				ShowcaseID: showcaseID,
+			}, nil
+		}
+		return &ParsedTarget{
+			IsShowcase: true,
+			ShowcaseID: showcaseID,
+		}, nil
+	}
+
+	// Caso: player.vimeo.com/video/123456?h=abcdef
+	if m := playerURLRegex.FindStringSubmatch(raw); len(m) > 1 {
+		h := parsed.Query().Get("h")
+		return &ParsedTarget{
+			VideoID:      m[1],
+			UnlistedHash: h,
+		}, nil
+	}
+
+	// Caso: vimeo.com/123456 o vimeo.com/123456/abcdef
+	if m := vimeoURLRegex.FindStringSubmatch(raw); len(m) > 1 {
+		res := &ParsedTarget{VideoID: m[1]}
+		if len(m) > 2 && m[2] != "" {
+			res.UnlistedHash = m[2]
+		}
+		if h := parsed.Query().Get("h"); h != "" {
+			res.UnlistedHash = h
+		}
+		return res, nil
+	}
+
+	return nil, fmt.Errorf("no se pudo reconocer un ID de video o showcase de Vimeo en: %s", raw)
+}

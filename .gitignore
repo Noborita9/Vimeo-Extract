@@ -1,0 +1,12 @@
+# Binarios
+/vimeo-fetcher
+*.exe
+
+# Salida de transcripciones
+output/*
+!output/.gitkeep
+
+# IDE y sistema
+.DS_Store
+.idea/
+.vscode/
