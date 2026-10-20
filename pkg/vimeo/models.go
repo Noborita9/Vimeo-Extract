@@ -11,6 +11,30 @@ type PlayerConfig struct {
 	Request PlayerRequest `json:"request"`
 }
 
+func (c *PlayerConfig) GetHLSURL() string {
+	if c.Request.Files.HLS == nil {
+		return ""
+	}
+	hls := c.Request.Files.HLS
+	if data, ok := hls.CDNs[hls.DefaultCDN]; ok {
+		if data.URL != "" {
+			return data.URL
+		}
+		if data.AvcURL != "" {
+			return data.AvcURL
+		}
+	}
+	for _, data := range hls.CDNs {
+		if data.URL != "" {
+			return data.URL
+		}
+		if data.AvcURL != "" {
+			return data.AvcURL
+		}
+	}
+	return ""
+}
+
 type VideoInfo struct {
 	ID    int64  `json:"id"`
 	Title string `json:"title"`
@@ -18,7 +42,22 @@ type VideoInfo struct {
 }
 
 type PlayerRequest struct {
+	Files      FilesInfo   `json:"files"`
 	TextTracks []TextTrack `json:"text_tracks"`
+}
+
+type FilesInfo struct {
+	HLS *HLSInfo `json:"hls"`
+}
+
+type HLSInfo struct {
+	DefaultCDN string                `json:"default_cdn"`
+	CDNs       map[string]HLSCDNData `json:"cdns"`
+}
+
+type HLSCDNData struct {
+	URL    string `json:"url"`
+	AvcURL string `json:"avc_url"`
 }
 
 type TextTrack struct {
@@ -45,6 +84,6 @@ type AlbumVideo struct {
 }
 
 type AlbumSingleVideoResponse struct {
-	Name            string `json:"name"`
-	PlayerEmbedURL  string `json:"player_embed_url"`
+	Name           string `json:"name"`
+	PlayerEmbedURL string `json:"player_embed_url"`
 }
