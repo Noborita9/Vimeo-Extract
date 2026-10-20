@@ -1,0 +1,107 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      tag_name:
+        description: 'Tag de versión para la release (ej: v1.0.0)'
+        required: true
+        default: 'v1.0.0'
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    name: Build Binaries and Publish Release
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: 'stable'
+          check-latest: true
+
+      - name: Determine Version Tag
+        id: vars
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            TAG="${{ github.event.inputs.tag_name }}"
+          else
+            TAG="${{ github.ref_name }}"
+          fi
+          echo "tag=${TAG}" >> $GITHUB_OUTPUT
+          echo "Version: ${TAG}"
+
+      - name: Build Binaries
+        env:
+          CGO_ENABLED: 0
+          TAG: ${{ steps.vars.outputs.tag }}
+        run: |
+          mkdir -p dist
+
+          echo "Building for macOS Apple Silicon (M1/M2/M3+)..."
+          GOOS=darwin GOARCH=arm64 go build -ldflags="-s -w" -o dist/vimeo-fetcher ./cmd/vimeo-fetcher
+          tar -czf "dist/vimeo-fetcher-${TAG}-darwin-arm64.tar.gz" -C dist vimeo-fetcher
+          rm dist/vimeo-fetcher
+
+          echo "Building for macOS Intel (amd64)..."
+          GOOS=darwin GOARCH=amd64 go build -ldflags="-s -w" -o dist/vimeo-fetcher ./cmd/vimeo-fetcher
+          tar -czf "dist/vimeo-fetcher-${TAG}-darwin-amd64.tar.gz" -C dist vimeo-fetcher
+          rm dist/vimeo-fetcher
+
+          echo "Building for Windows (amd64)..."
+          GOOS=windows GOARCH=amd64 go build -ldflags="-s -w" -o dist/vimeo-fetcher.exe ./cmd/vimeo-fetcher
+          zip -j "dist/vimeo-fetcher-${TAG}-windows-amd64.zip" dist/vimeo-fetcher.exe
+          rm dist/vimeo-fetcher.exe
+
+          echo "Building for Linux (amd64)..."
+          GOOS=linux GOARCH=amd64 go build -ldflags="-s -w" -o dist/vimeo-fetcher ./cmd/vimeo-fetcher
+          tar -czf "dist/vimeo-fetcher-${TAG}-linux-amd64.tar.gz" -C dist vimeo-fetcher
+          rm dist/vimeo-fetcher
+
+          echo "Generating Checksums..."
+          cd dist
+          sha256sum * > sha256sums.txt
+          cd ..
+
+      - name: Create or Update GitHub Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ steps.vars.outputs.tag }}
+        run: |
+          # Si la release ya existe, la actualiza; si no, la crea
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            echo "Updating existing release $TAG..."
+            gh release upload "$TAG" dist/* --clobber
+          else
+            echo "Creating new release $TAG..."
+            gh release create "$TAG" dist/* \
+              --title "Release $TAG" \
+              --generate-notes
+          fi
+
+      - name: Prune Older Releases (Keep last 20)
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          echo "Verificando límite de las últimas 20 releases..."
+          # Obtiene los tags a partir del elemento 20 (es decir, del 21 en adelante)
+          OLD_RELEASES=$(gh release list --limit 100 --json tagName --jq '.[20:][].tagName')
+
+          if [ -n "$OLD_RELEASES" ]; then
+            for OLD_TAG in $OLD_RELEASES; do
+              echo "Eliminando release antigua fuera del límite de 20: $OLD_TAG"
+              gh release delete "$OLD_TAG" --cleanup-tag --yes
+            done
+          else
+            echo "La cantidad actual de releases está dentro del límite permitido (20)."
+          fi
