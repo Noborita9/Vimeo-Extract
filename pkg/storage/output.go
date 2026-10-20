@@ -9,7 +9,11 @@ import (
 )
 
 var (
-	classTitleRegex  = regexp.MustCompile(`^[A-Z]+-\d+-(.+?)-\d+-.*\|\s*(\d{2})-(\d{2})-(\d{4})`)
+	// Soporta títulos de ORT como:
+	// - "FI-7669-Fundamentos de Ingeniería  SF-78522-ID_ N4A0826 _FIS | 14-10-2026"
+	// - "FI-7669-Fundamentos de Ingeniería SF-78522-13-10-2026"
+	// - "FI-6411-Finanzas y val. de proy.-78428-AN_N7B0826 _FI | 15-10-2026"
+	classTitleRegex  = regexp.MustCompile(`^[A-Z]+-\d+-(.+?)(?:-\d+.*?(?:[|\s-]+))?(\d{2})-(\d{2})-(\d{4})\s*$`)
 	invalidCharRegex = regexp.MustCompile(`[\\/:*?"<>|\x00-\x1f]+`)
 	multiSpaceRegex  = regexp.MustCompile(`\s+`)
 )
@@ -20,7 +24,8 @@ type OutputPathInfo struct {
 }
 
 func DetermineOutputPath(title string) OutputPathInfo {
-	match := classTitleRegex.FindStringSubmatch(title)
+	trimmed := strings.TrimSpace(title)
+	match := classTitleRegex.FindStringSubmatch(trimmed)
 	if len(match) == 5 {
 		subject := SanitizeFilename(match[1])
 		day := match[2]
@@ -32,7 +37,7 @@ func DetermineOutputPath(title string) OutputPathInfo {
 		}
 	}
 
-	sanitized := SanitizeFilename(title)
+	sanitized := SanitizeFilename(trimmed)
 	if sanitized == "" {
 		sanitized = "transcripcion-vimeo"
 	}
