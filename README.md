@@ -62,7 +62,23 @@ go build -o vimeo-fetcher ./cmd/vimeo-fetcher
 ./vimeo-fetcher -u "https://vimeo.com/showcase/12367680" -p "M1awjQrt" -f
 ```
 
-### Opciones disponibles
+### 6. Recopilar todos los transcripts en una sola carpeta (Selector / LLMs) 📁
+Aplana y centraliza todos los `transcript.md` en una única carpeta `output/transcripts/` (con nombres del tipo `<Materia> - <Fecha>.md`) para seleccionarlos fácilmente o subirlos juntos a un LLM:
+
+```bash
+# Recopilar todos los transcripts existentes en output/transcripts/:
+./vimeo-fetcher collect
+
+# Recopilar solo los de una materia:
+./vimeo-fetcher collect -s "Bases de datos 1"
+# o pasando el nombre como argumento:
+./vimeo-fetcher collect "Fundamentos de Ingeniería SF"
+
+# Descargar y recopilar automáticamente al terminar con la flag -c:
+./vimeo-fetcher -u "https://vimeo.com/showcase/12367680" -p "M1awjQrt" -c
+```
+
+### Opciones disponibles para descargas
 
 | Flag | Descripción | Por defecto |
 |---|---|---|
@@ -70,8 +86,22 @@ go build -o vimeo-fetcher ./cmd/vimeo-fetcher
 | `-p, --password` | Contraseña del video o showcase | `""` |
 | `-v, --video` | Descargar también el video `.mp4` | `false` |
 | `--only-video` | Descargar únicamente el video `.mp4` (sin transcripción) | `false` |
+| `-c, --collect` | Recopilar automáticamente en `output/transcripts/` al finalizar | `false` |
 | `-f, --force` | Sobrescribir si ya existe en `output/` | `false` |
 | `-o, --output` | Carpeta base de destino | `./output` |
 | `-l, --lang` | Idioma de subtítulos preferido | `es` |
 | `-r, --referer` | Referer HTTP si está restringido por dominio | `""` |
 | `--list-tracks` | Solo lista los idiomas y streams disponibles sin descargar | `false` |
+
+### Opciones del comando `collect`
+
+```bash
+./vimeo-fetcher collect [opciones] [materia opcional]
+```
+
+| Flag | Descripción | Por defecto |
+|---|---|---|
+| `-o, --output` | Directorio base de output | `./output` |
+| `-d, --dest` | Directorio destino para los transcripts planos | `<output>/transcripts` |
+| `-s, --subject` | Filtrar por nombre de materia | `""` (todas) |
+| `--no-per-subject`| No generar subcarpetas `transcripts/` por materia | `false` |

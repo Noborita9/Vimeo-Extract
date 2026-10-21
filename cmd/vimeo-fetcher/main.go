@@ -4,6 +4,7 @@ import (
 	"flag"
 	"fmt"
 	"os"
+	"path/filepath"
 	"strings"
 
 	"github.com/Noborita9/Vimeo-Transcript-Fetcher/pkg/storage"
@@ -12,6 +13,14 @@ import (
 )
 
 func main() {
+	if len(os.Args) > 1 {
+		subcmd := os.Args[1]
+		if subcmd == "collect" || subcmd == "export-transcripts" || subcmd == "collect-transcripts" {
+			runCollect(os.Args[2:])
+			return
+		}
+	}
+
 	var (
 		rawURL        string
 		password      string
@@ -21,6 +30,7 @@ func main() {
 		downloadVideo bool
 		onlyVideo     bool
 		force         bool
+		collectAfter  bool
 		listTracks    bool
 	)
 
@@ -39,19 +49,23 @@ func main() {
 	flag.BoolVar(&onlyVideo, "only-video", false, "Descargar únicamente el video .mp4 (sin transcripción)")
 	flag.BoolVar(&force, "f", false, "Sobrescribir si ya existe")
 	flag.BoolVar(&force, "force", false, "Sobrescribir si ya existe")
+	flag.BoolVar(&collectAfter, "c", false, "Recopilar todos los transcripts en output/transcripts/ al finalizar")
+	flag.BoolVar(&collectAfter, "collect", false, "Recopilar todos los transcripts en output/transcripts/ al finalizar")
 	flag.BoolVar(&listTracks, "list-tracks", false, "Solo listar los tracks de subtítulos disponibles")
 
 	flag.Usage = func() {
-		fmt.Fprintf(os.Stderr, "Uso: vimeo-fetcher [opciones] <URL o ID>\n\n")
-		fmt.Fprintf(os.Stderr, "Ejemplos:\n")
+		fmt.Fprintf(os.Stderr, "Uso: vimeo-fetcher [comando | opciones] <URL o ID>\n\n")
+		fmt.Fprintf(os.Stderr, "Comandos disponibles:\n")
+		fmt.Fprintf(os.Stderr, "  collect [opciones]       Recopila todos los transcripts en una sola carpeta (output/transcripts/)\n\n")
+		fmt.Fprintf(os.Stderr, "Ejemplos de descarga:\n")
 		fmt.Fprintf(os.Stderr, "  # Solo transcripción (por defecto):\n")
 		fmt.Fprintf(os.Stderr, "  vimeo-fetcher -u \"https://vimeo.com/showcase/12367680?video=1236100586\" -p \"M1awjQrt\"\n\n")
 		fmt.Fprintf(os.Stderr, "  # Transcripción + Video .mp4:\n")
 		fmt.Fprintf(os.Stderr, "  vimeo-fetcher -u \"https://vimeo.com/showcase/12367680?video=1236100586\" -p \"M1awjQrt\" -v\n\n")
-		fmt.Fprintf(os.Stderr, "  # Descargar todo un showcase con video:\n")
-		fmt.Fprintf(os.Stderr, "  vimeo-fetcher -u \"https://vimeo.com/showcase/12367680\" -p \"M1awjQrt\" -v\n\n")
-		fmt.Fprintf(os.Stderr, "  # Descargar únicamente video sin transcripción:\n")
-		fmt.Fprintf(os.Stderr, "  vimeo-fetcher -u \"https://vimeo.com/123456789\" -p \"secreto\" --only-video\n\n")
+		fmt.Fprintf(os.Stderr, "  # Descargar todo un showcase con video y recopilar transcripts:\n")
+		fmt.Fprintf(os.Stderr, "  vimeo-fetcher -u \"https://vimeo.com/showcase/12367680\" -p \"M1awjQrt\" -v -c\n\n")
+		fmt.Fprintf(os.Stderr, "  # Recopilar todos los transcripts existentes en output/transcripts/:\n")
+		fmt.Fprintf(os.Stderr, "  vimeo-fetcher collect\n\n")
 		fmt.Fprintf(os.Stderr, "Opciones:\n")
 		flag.PrintDefaults()
 	}
@@ -138,6 +152,10 @@ func main() {
 			}
 		}
 		fmt.Printf("🎉 Proceso finalizado: %d procesados, %d salteados (total: %d videos).\n", successCount, skippedCount, len(videos))
+
+		if collectAfter {
+			autoCollect(outputDir)
+		}
 		return
 	}
 
@@ -163,6 +181,10 @@ func main() {
 			os.Exit(1)
 		}
 		fmt.Println("✅ ¡Completado con éxito!")
+
+		if collectAfter {
+			autoCollect(outputDir)
+		}
 		return
 	}
 
@@ -185,6 +207,91 @@ func main() {
 		os.Exit(1)
 	}
 	fmt.Println("✅ ¡Completado con éxito!")
+
+	if collectAfter {
+		autoCollect(outputDir)
+	}
+}
+
+func runCollect(args []string) {
+	fs := flag.NewFlagSet("collect", flag.ExitOnError)
+	var (
+		outputDir     string
+		destDir       string
+		subjectFilter string
+		noPerSubject  bool
+	)
+
+	fs.StringVar(&outputDir, "o", "./output", "Directorio base de output")
+	fs.StringVar(&outputDir, "output", "./output", "Directorio base de output")
+	fs.StringVar(&destDir, "d", "", "Directorio de destino (por defecto: <output>/transcripts)")
+	fs.StringVar(&destDir, "dest", "", "Directorio de destino (por defecto: <output>/transcripts)")
+	fs.StringVar(&subjectFilter, "s", "", "Filtrar por materia específica")
+	fs.StringVar(&subjectFilter, "subject", "", "Filtrar por materia específica")
+	fs.BoolVar(&noPerSubject, "no-per-subject", false, "No crear subcarpetas transcripts/ dentro de cada materia")
+
+	fs.Usage = func() {
+		fmt.Fprintf(os.Stderr, "Uso: vimeo-fetcher collect [opciones] [materia opcional]\n\n")
+		fmt.Fprintf(os.Stderr, "Recopila todos los archivos transcript.md en una carpeta única y plana dentro de output.\n")
+		fmt.Fprintf(os.Stderr, "Ideal para seleccionar o pasar todos los transcripts juntos a herramientas, LLMs o selectores.\n\n")
+		fmt.Fprintf(os.Stderr, "Ejemplos:\n")
+		fmt.Fprintf(os.Stderr, "  # Recopilar todos los transcripts en output/transcripts/:\n")
+		fmt.Fprintf(os.Stderr, "  vimeo-fetcher collect\n\n")
+		fmt.Fprintf(os.Stderr, "  # Recopilar solo una materia en particular:\n")
+		fmt.Fprintf(os.Stderr, "  vimeo-fetcher collect -s \"Bases de datos 1\"\n\n")
+		fmt.Fprintf(os.Stderr, "  # Guardar en una carpeta personalizada:\n")
+		fmt.Fprintf(os.Stderr, "  vimeo-fetcher collect -d \"./mis_transcripts\"\n\n")
+		fmt.Fprintf(os.Stderr, "Opciones:\n")
+		fs.PrintDefaults()
+	}
+
+	_ = fs.Parse(args)
+
+	// Si se pasa argumento posicional, usarlo como filtro de materia
+	if subjectFilter == "" && fs.NArg() > 0 {
+		subjectFilter = fs.Arg(0)
+	}
+
+	if destDir == "" {
+		destDir = filepath.Join(outputDir, "transcripts")
+	}
+
+	// Migrar formato antiguo si todavía existe
+	storage.MigrateOldFormat(outputDir)
+
+	fmt.Printf("🔍 Recopilando transcripts desde: %s\n", outputDir)
+	results, err := storage.CollectTranscripts(storage.CollectOptions{
+		BaseDir:       outputDir,
+		GlobalDestDir: destDir,
+		SubjectFilter: subjectFilter,
+		PerSubject:    !noPerSubject,
+	})
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "❌ Error al recopilar transcripts: %v\n", err)
+		os.Exit(1)
+	}
+
+	if len(results) == 0 {
+		fmt.Println("⚠️ No se encontraron archivos transcript.md para recopilar.")
+		return
+	}
+
+	fmt.Printf("✅ Se recopilaron %d transcripts en:\n👉 %s\n", len(results), destDir)
+	if !noPerSubject {
+		fmt.Println("📁 También se actualizaron las subcarpetas per-materia (ej: output/<materia>/transcripts/)")
+	}
+}
+
+func autoCollect(outputDir string) {
+	destDir := filepath.Join(outputDir, "transcripts")
+	results, err := storage.CollectTranscripts(storage.CollectOptions{
+		BaseDir:       outputDir,
+		GlobalDestDir: destDir,
+		PerSubject:    true,
+	})
+	if err == nil && len(results) > 0 {
+		fmt.Printf("📦 Transcripts sincronizados automáticamente en: %s\n", destDir)
+	}
 }
 
 func processShowcaseVideo(client *vimeo.Client, showcaseID, videoID, hashedPass, referer, outputDir, langPref string, wantTranscript, wantVideo, force, listOnly bool) error {
